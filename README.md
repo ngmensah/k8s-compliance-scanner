@@ -44,4 +44,4 @@ The scanner generates two files:
 
 ## Example
 
-Sample manifest and output report included in the repo.
+![Compliance Report Screenshot](ai-compliance-scanner-screenshot.png)
