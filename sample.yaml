@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sample-app
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: nginx:latest
+      securityContext:
+        privileged: true
+        runAsUser: 0
+      ports:
+        - containerPort: 80
+      env:
+        - name: DB_PASSWORD
+          value: "supersecretpassword123"
+      resources: {}
+  hostNetwork: true
+  hostPID: true
