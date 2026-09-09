@@ -1,156 +1,159 @@
-from dotenv import load_dotenv
+import argparse
+import html
 import os
-import anthropic
+import sys
 from datetime import datetime
+
+from dotenv import load_dotenv
+
+from controls import SEVERITY_ORDER
+from rules import check_manifest
 
 load_dotenv()
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+MODEL = "claude-sonnet-4-6"
 
 
-def scan_manifest(file_path):
-    with open(file_path, "r") as f:
-        manifest = f.read()
+def get_client():
+    import anthropic
+
+    return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+def build_ai_summary(manifest_text, findings, file_path):
+    """Ask Claude for a short narrative synthesis of the findings.
+
+    The model is deliberately NOT asked to decide severity or compliance
+    mapping -- those come from the deterministic rule table in controls.py.
+    Its only job here is to write plain-English context for a human reader.
+    """
+    if not findings:
+        finding_lines = "(no deterministic findings were triggered)"
+    else:
+        finding_lines = "\n".join(
+            f"- [{f.severity}] {f.title} ({f.resource_kind}/{f.resource_name}, {f.location})"
+            for f in findings
+        )
 
     prompt = f"""You are a security-focused DevOps engineer with a compliance background.
 
-Review the following Kubernetes manifest for security misconfigurations.
+A rule-based scanner already analyzed the Kubernetes manifest below and produced
+the findings listed. Do NOT invent new findings, change severities, or cite
+compliance control numbers -- that has already been done deterministically.
 
-For each issue found:
-- Give it a severity level: HIGH, MEDIUM, or LOW
-- Explain what the problem is in plain English
-- Explain why it matters from a compliance perspective
-- Suggest how to fix it
+Your only job: write a short (3-6 sentence) plain-English executive summary
+that explains, in context, how these specific findings combine to create risk
+for someone reviewing this manifest for the first time.
+
+File: {file_path}
+
+Findings:
+{finding_lines}
 
 Manifest:
-{manifest}"""
+{manifest_text}"""
 
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
+    message = get_client().messages.create(
+        model=MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
     )
 
-    return message.content[0].text, manifest
+    return message.content[0].text.strip()
 
 
-def save_text_report(output, report_path="report.txt"):
+def severity_counts(findings):
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for f in findings:
+        counts[f.severity] += 1
+    return counts
+
+
+def save_text_report(findings, summary, manifest_path, report_path="report.txt"):
+    counts = severity_counts(findings)
+    timestamp = datetime.now().strftime("%B %d, %Y at %H:%M")
+
+    lines = [
+        "K8s Compliance Scan Report",
+        f"Manifest: {manifest_path}",
+        f"Generated: {timestamp}",
+        "",
+        "SUMMARY",
+        summary,
+        "",
+        f"FINDINGS ({len(findings)} total: {counts['HIGH']} High, "
+        f"{counts['MEDIUM']} Medium, {counts['LOW']} Low)",
+        "",
+    ]
+
+    for f in findings:
+        meta = f.meta
+        lines.append(f"[{f.severity}] {f.title}")
+        lines.append(f"  Resource: {f.resource_kind}/{f.resource_name} ({f.location})")
+        if f.detail:
+            lines.append(f"  Detail: {f.detail}")
+        lines.append(f"  CIS: {meta['cis']}")
+        lines.append(f"  NIST 800-53: {meta['nist_800_53']}")
+        lines.append(f"  PCI DSS: {meta['pci_dss']}")
+        lines.append(f"  SOC 2: {meta['soc2']}")
+        lines.append(f"  Remediation: {meta['remediation']}")
+        if meta.get("note"):
+            lines.append(f"  Note: {meta['note']}")
+        lines.append("-" * 60)
+
+    output = "\n".join(lines)
     with open(report_path, "w") as f:
         f.write(output)
     print(f"Text report saved to {report_path}")
 
 
-def save_html_report(output, manifest, file_path, report_path="report.html"):
+def _finding_card_html(f):
+    meta = f.meta
+    detail_html = (
+        f'<div class="finding-detail">{html.escape(f.detail)}</div>' if f.detail else ""
+    )
+    note_html = (
+        f'<div class="finding-note">Note: {html.escape(meta["note"])}</div>'
+        if meta.get("note")
+        else ""
+    )
+    return f"""
+        <div class="finding-card {f.severity.lower()}">
+            <div class="finding-head">
+                <span class="badge {f.severity.lower()}">{f.severity}</span>
+                <span class="finding-title">{html.escape(f.title)}</span>
+            </div>
+            <div class="finding-resource">{html.escape(f.resource_kind)}/{html.escape(f.resource_name)} &middot; {html.escape(f.location)}</div>
+            {detail_html}
+            <div class="control-grid">
+                <div><span class="control-label">CIS</span>{html.escape(meta['cis'])}</div>
+                <div><span class="control-label">NIST 800-53</span>{html.escape(meta['nist_800_53'])}</div>
+                <div><span class="control-label">PCI DSS</span>{html.escape(meta['pci_dss'])}</div>
+                <div><span class="control-label">SOC 2</span>{html.escape(meta['soc2'])}</div>
+            </div>
+            <div class="remediation"><span class="control-label">Remediation</span>{html.escape(meta['remediation'])}</div>
+            {note_html}
+        </div>"""
+
+
+def save_html_report(findings, summary, manifest_text, manifest_path, report_path="report.html"):
     timestamp = datetime.now().strftime("%B %d, %Y at %H:%M")
+    counts = severity_counts(findings)
 
-    # Count severities from output
-    high = output.upper().count("HIGH")
-    medium = output.upper().count("MEDIUM")
-    low = output.upper().count("LOW")
+    findings_html = (
+        "\n".join(_finding_card_html(f) for f in findings)
+        if findings
+        else '<p class="no-findings">No deterministic findings were triggered against the current rule set.</p>'
+    )
 
-    # Convert markdown-style content to basic HTML
-    def convert_to_html(text):
-        lines = text.split("\n")
-        html_lines = []
-        in_code_block = False
-        in_table = False
-
-        for line in lines:
-            # Code blocks
-            if line.strip().startswith("```"):
-                if in_code_block:
-                    html_lines.append("</code></pre>")
-                    in_code_block = False
-                else:
-                    lang = line.strip().replace("```", "").strip()
-                    html_lines.append(f'<pre><code class="language-{lang}">')
-                    in_code_block = True
-                continue
-
-            if in_code_block:
-                html_lines.append(
-                    line.replace("&", "&amp;")
-                        .replace("<", "&lt;")
-                        .replace(">", "&gt;")
-                )
-                continue
-
-            # Tables
-            if line.strip().startswith("|"):
-                if not in_table:
-                    html_lines.append('<table>')
-                    in_table = True
-                if "---" in line:
-                    continue
-                cells = [c.strip() for c in line.split("|")[1:-1]]
-                is_header = html_lines and "<table>" in html_lines[-2] if len(html_lines) >= 2 else False
-                tag = "th" if is_header else "td"
-                row = "".join(f"<{tag}>{c}</{tag}>" for c in cells)
-                html_lines.append(f"<tr>{row}</tr>")
-                continue
-            else:
-                if in_table:
-                    html_lines.append("</table>")
-                    in_table = False
-
-            # Severity badges inline
-            line = line.replace(
-                "🔴 HIGH", '<span class="badge high">HIGH</span>'
-            ).replace(
-                "🟡 MEDIUM", '<span class="badge medium">MEDIUM</span>'
-            ).replace(
-                "🟢 LOW", '<span class="badge low">LOW</span>'
-            )
-
-            # Headings
-            if line.startswith("## "):
-                html_lines.append(f'<h2>{line[3:]}</h2>')
-            elif line.startswith("### "):
-                html_lines.append(f'<h3>{line[4:]}</h3>')
-            elif line.startswith("# "):
-                html_lines.append(f'<h1>{line[2:]}</h1>')
-            # Bold
-            elif line.strip().startswith("**") and line.strip().endswith("**"):
-                html_lines.append(f'<p><strong>{line.strip()[2:-2]}</strong></p>')
-            # Blockquote
-            elif line.startswith("> "):
-                html_lines.append(f'<blockquote>{line[2:]}</blockquote>')
-            # List items
-            elif line.strip().startswith("- "):
-                html_lines.append(f'<li>{line.strip()[2:]}</li>')
-            # Horizontal rule
-            elif line.strip() == "---":
-                html_lines.append('<hr>')
-            # Empty line
-            elif line.strip() == "":
-                html_lines.append('<br>')
-            # Regular paragraph
-            else:
-                html_lines.append(f'<p>{line}</p>')
-
-        if in_table:
-            html_lines.append("</table>")
-        if in_code_block:
-            html_lines.append("</code></pre>")
-
-        return "\n".join(html_lines)
-
-    body_content = convert_to_html(output)
-
-    html = f"""<!DOCTYPE html>
+    html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>K8s Compliance Report</title>
     <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 
         body {{
             font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
@@ -160,7 +163,6 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             min-height: 100vh;
         }}
 
-        /* Header */
         .header {{
             background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
             border-bottom: 1px solid #30363d;
@@ -204,11 +206,7 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             flex-wrap: wrap;
         }}
 
-        .meta-item {{
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }}
+        .meta-item {{ display: flex; flex-direction: column; gap: 2px; }}
 
         .meta-label {{
             font-size: 11px;
@@ -224,7 +222,6 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             font-family: 'Courier New', monospace;
         }}
 
-        /* Severity summary */
         .summary-bar {{
             background: #161b22;
             border-bottom: 1px solid #30363d;
@@ -235,12 +232,7 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             flex-wrap: wrap;
         }}
 
-        .summary-label {{
-            font-size: 13px;
-            color: #8b949e;
-            font-weight: 600;
-            margin-right: 8px;
-        }}
+        .summary-label {{ font-size: 13px; color: #8b949e; font-weight: 600; margin-right: 8px; }}
 
         .severity-pill {{
             display: flex;
@@ -253,35 +245,15 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             letter-spacing: 0.5px;
         }}
 
-        .severity-pill.high {{
-            background: rgba(248, 81, 73, 0.15);
-            border: 1px solid rgba(248, 81, 73, 0.4);
-            color: #f85149;
-        }}
+        .severity-pill.high {{ background: rgba(248, 81, 73, 0.15); border: 1px solid rgba(248, 81, 73, 0.4); color: #f85149; }}
+        .severity-pill.medium {{ background: rgba(210, 153, 34, 0.15); border: 1px solid rgba(210, 153, 34, 0.4); color: #d29922; }}
+        .severity-pill.low {{ background: rgba(63, 185, 80, 0.15); border: 1px solid rgba(63, 185, 80, 0.4); color: #3fb950; }}
 
-        .severity-pill.medium {{
-            background: rgba(210, 153, 34, 0.15);
-            border: 1px solid rgba(210, 153, 34, 0.4);
-            color: #d29922;
-        }}
-
-        .severity-pill.low {{
-            background: rgba(63, 185, 80, 0.15);
-            border: 1px solid rgba(63, 185, 80, 0.4);
-            color: #3fb950;
-        }}
-
-        .dot {{
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-        }}
-
+        .dot {{ width: 8px; height: 8px; border-radius: 50%; }}
         .high .dot {{ background: #f85149; }}
         .medium .dot {{ background: #d29922; }}
         .low .dot {{ background: #3fb950; }}
 
-        /* Main layout */
         .container {{
             max-width: 1100px;
             margin: 0 auto;
@@ -291,112 +263,62 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             gap: 40px;
         }}
 
-        /* Report content */
-        .report-content {{
-            min-width: 0;
-        }}
+        .report-content {{ min-width: 0; }}
 
-        h1 {{
-            font-size: 22px;
-            font-weight: 700;
-            color: #f0f6fc;
-            margin: 32px 0 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #30363d;
-        }}
-
-        h2 {{
-            font-size: 18px;
-            font-weight: 600;
-            color: #58a6ff;
-            margin: 28px 0 10px;
-            padding: 16px 20px;
-            background: #161b22;
-            border-left: 3px solid #58a6ff;
-            border-radius: 0 6px 6px 0;
-        }}
-
-        h3 {{
-            font-size: 14px;
-            font-weight: 600;
-            color: #8b949e;
-            text-transform: uppercase;
-            letter-spacing: 0.8px;
-            margin: 20px 0 8px;
-        }}
-
-        p {{
-            font-size: 14px;
-            color: #c9d1d9;
-            margin-bottom: 8px;
-        }}
-
-        li {{
-            font-size: 14px;
-            color: #c9d1d9;
-            margin: 4px 0 4px 20px;
-            list-style: disc;
-        }}
-
-        pre {{
+        .exec-summary {{
             background: #161b22;
             border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 16px;
-            overflow-x: auto;
-            margin: 12px 0;
-        }}
-
-        code {{
-            font-family: 'Courier New', monospace;
-            font-size: 13px;
-            color: #e6edf3;
-            line-height: 1.6;
-        }}
-
-        blockquote {{
-            border-left: 3px solid #d29922;
-            padding: 10px 16px;
-            background: rgba(210, 153, 34, 0.08);
-            border-radius: 0 6px 6px 0;
-            font-size: 13px;
+            border-left: 3px solid #58a6ff;
+            border-radius: 0 8px 8px 0;
+            padding: 20px 24px;
+            margin-bottom: 32px;
+            font-size: 14px;
             color: #c9d1d9;
-            margin: 12px 0;
         }}
 
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin: 12px 0;
-            font-size: 13px;
-        }}
+        .exec-summary h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #58a6ff; margin-bottom: 10px; }}
 
-        th {{
+        .finding-card {{
             background: #161b22;
-            color: #8b949e;
-            text-transform: uppercase;
-            font-size: 11px;
-            letter-spacing: 0.8px;
-            padding: 10px 14px;
-            text-align: left;
-            border-bottom: 1px solid #30363d;
+            border: 1px solid #30363d;
+            border-left: 3px solid #30363d;
+            border-radius: 0 8px 8px 0;
+            padding: 20px 24px;
+            margin-bottom: 16px;
         }}
 
-        td {{
-            padding: 10px 14px;
-            border-bottom: 1px solid #21262d;
+        .finding-card.high {{ border-left-color: #f85149; }}
+        .finding-card.medium {{ border-left-color: #d29922; }}
+        .finding-card.low {{ border-left-color: #3fb950; }}
+
+        .finding-head {{ display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }}
+        .finding-title {{ font-size: 15px; font-weight: 600; color: #f0f6fc; }}
+        .finding-resource {{ font-size: 12px; color: #8b949e; font-family: 'Courier New', monospace; margin-bottom: 12px; }}
+        .finding-detail {{ font-size: 12px; color: #8b949e; font-family: 'Courier New', monospace; margin-bottom: 12px; }}
+        .finding-note {{ font-size: 12px; color: #8b949e; font-style: italic; margin-top: 8px; }}
+
+        .control-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px 24px;
+            font-size: 13px;
             color: #c9d1d9;
+            margin-bottom: 12px;
         }}
 
-        tr:last-child td {{
-            border-bottom: none;
+        .control-label {{
+            display: block;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: #8b949e;
+            font-weight: 600;
+            margin-bottom: 2px;
         }}
 
-        hr {{
-            border: none;
-            border-top: 1px solid #30363d;
-            margin: 32px 0;
-        }}
+        .remediation {{ font-size: 13px; color: #c9d1d9; }}
+
+        .no-findings {{ color: #3fb950; font-size: 14px; }}
 
         .badge {{
             display: inline-block;
@@ -408,30 +330,11 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             text-transform: uppercase;
         }}
 
-        .badge.high {{
-            background: rgba(248, 81, 73, 0.15);
-            color: #f85149;
-            border: 1px solid rgba(248, 81, 73, 0.3);
-        }}
+        .badge.high {{ background: rgba(248, 81, 73, 0.15); color: #f85149; border: 1px solid rgba(248, 81, 73, 0.3); }}
+        .badge.medium {{ background: rgba(210, 153, 34, 0.15); color: #d29922; border: 1px solid rgba(210, 153, 34, 0.3); }}
+        .badge.low {{ background: rgba(63, 185, 80, 0.15); color: #3fb950; border: 1px solid rgba(63, 185, 80, 0.3); }}
 
-        .badge.medium {{
-            background: rgba(210, 153, 34, 0.15);
-            color: #d29922;
-            border: 1px solid rgba(210, 153, 34, 0.3);
-        }}
-
-        .badge.low {{
-            background: rgba(63, 185, 80, 0.15);
-            color: #3fb950;
-            border: 1px solid rgba(63, 185, 80, 0.3);
-        }}
-
-        /* Sidebar */
-        .sidebar {{
-            position: sticky;
-            top: 24px;
-            align-self: start;
-        }}
+        .sidebar {{ position: sticky; top: 24px; align-self: start; }}
 
         .sidebar-card {{
             background: #161b22;
@@ -470,18 +373,9 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             font-size: 13px;
         }}
 
-        .stat-row:last-child {{
-            border-bottom: none;
-        }}
-
-        .stat-label {{
-            color: #8b949e;
-        }}
-
-        .stat-value {{
-            font-weight: 600;
-            color: #e6edf3;
-        }}
+        .stat-row:last-child {{ border-bottom: none; }}
+        .stat-label {{ color: #8b949e; }}
+        .stat-value {{ font-weight: 600; color: #e6edf3; }}
 
         .footer {{
             text-align: center;
@@ -492,16 +386,10 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
         }}
 
         @media (max-width: 768px) {{
-            .container {{
-                grid-template-columns: 1fr;
-                padding: 24px;
-            }}
-            .header, .summary-bar {{
-                padding: 24px;
-            }}
-            .sidebar {{
-                position: static;
-            }}
+            .container {{ grid-template-columns: 1fr; padding: 24px; }}
+            .header, .summary-bar {{ padding: 24px; }}
+            .sidebar {{ position: static; }}
+            .control-grid {{ grid-template-columns: 1fr; }}
         }}
     </style>
 </head>
@@ -512,13 +400,13 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             <div class="logo">🛡️</div>
             <div>
                 <h1>K8s Compliance Scanner</h1>
-                <div class="subtitle">AI-powered Kubernetes security analysis</div>
+                <div class="subtitle">Rule-based Kubernetes security analysis with AI-generated narrative</div>
             </div>
         </div>
         <div class="meta-bar">
             <div class="meta-item">
                 <span class="meta-label">File Scanned</span>
-                <span class="meta-value">{file_path}</span>
+                <span class="meta-value">{html.escape(manifest_path)}</span>
             </div>
             <div class="meta-item">
                 <span class="meta-label">Generated</span>
@@ -526,69 +414,93 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
             </div>
             <div class="meta-item">
                 <span class="meta-label">Model</span>
-                <span class="meta-value">claude-sonnet-4-6</span>
+                <span class="meta-value">{MODEL}</span>
             </div>
         </div>
     </div>
 
     <div class="summary-bar">
         <span class="summary-label">FINDINGS:</span>
-        <div class="severity-pill high"><div class="dot"></div>{high} High</div>
-        <div class="severity-pill medium"><div class="dot"></div>{medium} Medium</div>
-        <div class="severity-pill low"><div class="dot"></div>{low} Low</div>
+        <div class="severity-pill high"><div class="dot"></div>{counts['HIGH']} High</div>
+        <div class="severity-pill medium"><div class="dot"></div>{counts['MEDIUM']} Medium</div>
+        <div class="severity-pill low"><div class="dot"></div>{counts['LOW']} Low</div>
     </div>
 
     <div class="container">
         <div class="report-content">
-            {body_content}
+            <div class="exec-summary">
+                <h2>Executive Summary</h2>
+                {html.escape(summary)}
+            </div>
+            {findings_html}
         </div>
 
         <div class="sidebar">
             <div class="sidebar-card">
                 <h4>Scan Summary</h4>
-                <div class="stat-row">
-                    <span class="stat-label">Total Issues</span>
-                    <span class="stat-value">{high + medium + low}</span>
-                </div>
-                <div class="stat-row">
-                    <span class="stat-label">High Severity</span>
-                    <span class="stat-value" style="color: #f85149">{high}</span>
-                </div>
-                <div class="stat-row">
-                    <span class="stat-label">Medium Severity</span>
-                    <span class="stat-value" style="color: #d29922">{medium}</span>
-                </div>
-                <div class="stat-row">
-                    <span class="stat-label">Low Severity</span>
-                    <span class="stat-value" style="color: #3fb950">{low}</span>
-                </div>
+                <div class="stat-row"><span class="stat-label">Total Issues</span><span class="stat-value">{len(findings)}</span></div>
+                <div class="stat-row"><span class="stat-label">High Severity</span><span class="stat-value" style="color: #f85149">{counts['HIGH']}</span></div>
+                <div class="stat-row"><span class="stat-label">Medium Severity</span><span class="stat-value" style="color: #d29922">{counts['MEDIUM']}</span></div>
+                <div class="stat-row"><span class="stat-label">Low Severity</span><span class="stat-value" style="color: #3fb950">{counts['LOW']}</span></div>
             </div>
 
             <div class="sidebar-card">
                 <h4>Manifest Preview</h4>
-                <div class="manifest-preview">{manifest[:800]}{"..." if len(manifest) > 800 else ""}</div>
+                <div class="manifest-preview">{html.escape(manifest_text[:800])}{"..." if len(manifest_text) > 800 else ""}</div>
             </div>
         </div>
     </div>
 
     <div class="footer">
-        Generated by K8s Compliance Scanner &nbsp;·&nbsp; Powered by Claude AI &nbsp;·&nbsp; {timestamp}
+        Generated by K8s Compliance Scanner &nbsp;·&nbsp; Compliance mappings are rule-based, not AI-generated &nbsp;·&nbsp; {timestamp}
     </div>
 
 </body>
 </html>"""
 
     with open(report_path, "w") as f:
-        f.write(html)
+        f.write(html_doc)
     print(f"HTML report saved to {report_path}")
 
 
+def run_scan(manifest_path, offline=False):
+    with open(manifest_path, "r") as f:
+        manifest_text = f.read()
+
+    findings = check_manifest(manifest_text)
+    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+
+    if offline or not os.getenv("ANTHROPIC_API_KEY"):
+        summary = (
+            "AI summary skipped (offline mode or no ANTHROPIC_API_KEY set). "
+            "Findings below are from the deterministic rule engine only."
+        )
+    else:
+        summary = build_ai_summary(manifest_text, findings, manifest_path)
+
+    return findings, summary, manifest_text
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scan a Kubernetes manifest for compliance issues.")
+    parser.add_argument("manifest", nargs="?", default="sample.yaml", help="Path to the manifest to scan")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip the AI narrative call and use rule-based findings only",
+    )
+    args = parser.parse_args()
+
+    print(f"Scanning {args.manifest}...\n")
+    findings, summary, manifest_text = run_scan(args.manifest, offline=args.offline)
+
+    counts = severity_counts(findings)
+    print(f"{len(findings)} findings ({counts['HIGH']} High, {counts['MEDIUM']} Medium, {counts['LOW']} Low)\n")
+    print(summary, "\n")
+
+    save_text_report(findings, summary, args.manifest)
+    save_html_report(findings, summary, manifest_text, args.manifest)
+
+
 if __name__ == "__main__":
-    manifest_path = "sample.yaml"
-
-    print(f"Scanning {manifest_path}...\n")
-    results, manifest = scan_manifest(manifest_path)
-
-    print(results)
-    save_text_report(results)
-    save_html_report(results, manifest, manifest_path)
+    sys.exit(main())
