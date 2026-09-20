@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 import os
 import anthropic
+import re
 from datetime import datetime
 
 load_dotenv()
@@ -51,6 +52,13 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
     low = output.upper().count("LOW")
 
     # Convert markdown-style content to basic HTML
+    def inline_md(text):
+        """Convert inline markdown within a line: bold, italic, code."""
+        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", text)
+        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        return text
+
     def convert_to_html(text):
         lines = text.split("\n")
         html_lines = []
@@ -87,7 +95,7 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
                 cells = [c.strip() for c in line.split("|")[1:-1]]
                 is_header = html_lines and "<table>" in html_lines[-2] if len(html_lines) >= 2 else False
                 tag = "th" if is_header else "td"
-                row = "".join(f"<{tag}>{c}</{tag}>" for c in cells)
+                row = "".join(f"<{tag}>{inline_md(c)}</{tag}>" for c in cells)
                 html_lines.append(f"<tr>{row}</tr>")
                 continue
             else:
@@ -106,20 +114,20 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
 
             # Headings
             if line.startswith("## "):
-                html_lines.append(f'<h2>{line[3:]}</h2>')
+                html_lines.append(f'<h2>{inline_md(line[3:])}</h2>')
             elif line.startswith("### "):
-                html_lines.append(f'<h3>{line[4:]}</h3>')
+                html_lines.append(f'<h3>{inline_md(line[4:])}</h3>')
             elif line.startswith("# "):
-                html_lines.append(f'<h1>{line[2:]}</h1>')
+                html_lines.append(f'<h1>{inline_md(line[2:])}</h1>')
             # Bold
             elif line.strip().startswith("**") and line.strip().endswith("**"):
-                html_lines.append(f'<p><strong>{line.strip()[2:-2]}</strong></p>')
+                html_lines.append(f'<p><strong>{inline_md(line.strip()[2:-2])}</strong></p>')
             # Blockquote
             elif line.startswith("> "):
-                html_lines.append(f'<blockquote>{line[2:]}</blockquote>')
+                html_lines.append(f'<blockquote>{inline_md(line[2:])}</blockquote>')
             # List items
             elif line.strip().startswith("- "):
-                html_lines.append(f'<li>{line.strip()[2:]}</li>')
+                html_lines.append(f'<li>{inline_md(line.strip()[2:])}</li>')
             # Horizontal rule
             elif line.strip() == "---":
                 html_lines.append('<hr>')
@@ -128,7 +136,7 @@ def save_html_report(output, manifest, file_path, report_path="report.html"):
                 html_lines.append('<br>')
             # Regular paragraph
             else:
-                html_lines.append(f'<p>{line}</p>')
+                html_lines.append(f'<p>{inline_md(line)}</p>')
 
         if in_table:
             html_lines.append("</table>")
